@@ -1,3 +1,17 @@
+/*
+ * WHAT IS THIS PROJECT?
+ * This is a small project to test "slab memory allocation" which solves fragmentation by keeping "slots" (individual pieces of memory) in "slabs" (contiguous chunks of memory) contiguous, which is often caused from allocating/deallocating small objects.
+ * Each type of object has its own "cache" (a slab collection), the cache keeps track of slabs which are full, partially full ("partial"), or empty.
+ * This theoretically also means a performance increase, as objects are preallocated.
+ * It is possible to keep allocs/frees O(1), but since I keep no metadata about location of pointers, this project has frees O(n); this would involve changing the linked lists to doubly-linked lists.
+ * 
+ * HIGHLIGHTS
+ * Increased performance by using bitmasking to keep track of full slots, and intrinsics such as __builtin_ctzl to locate free slots.
+ * This project makes use of memalign to ensure slabs start on a page size boundary, this is useful because CPUs will fetch cache lines (about 64 bytes), so we optimise the number of cache lines we need by aligning.
+ * 
+ * To test: compile and run test_slab.c
+ */
+
 #include "slab.h"
 
 #define _POSIX_C_SOURCE 200809L
@@ -17,6 +31,13 @@ struct S_Slab {
     u32 mask_count;
     S_Slab* next;
 };
+
+/*
+ * Default initiation but default order to 0, this works for many simple user specified tasks.
+ */
+void S_CacheSimpleInit(S_Cache* cache, u32 size) {
+    return S_CacheInit(cache, size, 0);
+}
 
 /*
  * Initialise cache for a specific struct, size of this struct indicated by the u32 size paramater.
@@ -56,6 +77,9 @@ u32 S_GetFirstFreeIndexAndMark(S_Slab* partial_slab) {
     return (bitmask_number << 6) + index;
 }
 
+/*
+ * Due to the size of structs, they may not fit perfectly into a slab, so we mark slots which would be "invalid" as always marked.
+ */
 void S_MarkInvalidSlotsAsUsed(S_Slab* new_slab, u32 total_slots) {
     if ((new_slab->mask_count << 6) == total_slots) return; // perfectly fits
 
@@ -71,6 +95,9 @@ void S_MarkInvalidSlotsAsUsed(S_Slab* new_slab, u32 total_slots) {
     }
 }
 
+/*
+ * Allocate the memory and assign a new slab to the cache.
+ */
 S_Slab* S_CreateNewSlab(S_Cache* cache) {
     S_Slab* new_slab = (S_Slab*)calloc(1, sizeof(S_Slab));
     u64 slab_memory_size = PAGE_SIZE << cache->order;
@@ -91,6 +118,9 @@ S_Slab* S_CreateNewSlab(S_Cache* cache) {
     return new_slab;
 }
 
+/*
+ * Check each slot of a slab has been taken up, i.e. slab full.
+ */
 bool S_CheckSlabFull(S_Slab* slab) {
     for (u32 i = 0; i < slab->mask_count; i++) {
         if (slab->bitmasks[i] != FULL_BITMASK) return false;    
@@ -98,6 +128,9 @@ bool S_CheckSlabFull(S_Slab* slab) {
     return true;
 }
 
+/*
+ * Checks slab is completely empty, i.e. no slots filled.
+ */
 bool S_CheckSlabEmpty(S_Cache* cache, S_Slab* slab) {
     u32 total_slots_used = (PAGE_SIZE << cache->order) / cache->object_size; // how many slots were actually used based on the user defined struct size 
     u32 masks_used_fully = (total_slots_used >> 6); // how many masks should have been used fully based on the total slots used
@@ -116,21 +149,33 @@ bool S_CheckSlabEmpty(S_Cache* cache, S_Slab* slab) {
     return true;
 }
 
+/*
+ * Adds slab to the "partial slabs" linked list. 
+ */
 void S_AddSlabToCachePartialList(S_Cache* cache, S_Slab* slab) {
     slab->next = cache->partial_list;
     cache->partial_list = slab;
 }
 
+/*
+ * Adds slab to the "full slabs" linked list. 
+ */
 void S_AddSlabToCacheFullList(S_Cache* cache, S_Slab* slab) {
     slab->next = cache->full_list;
     cache->full_list = slab;
 }
 
+/*
+ * Adds slab to the "free slabs" linked list. 
+ */
 void S_AddSlabToCacheFreeList(S_Cache* cache, S_Slab* slab) {
     slab->next = cache->free_list;
     cache->free_list = slab;
 }
 
+/*
+ * Occupy a slot for struct allocation; functions identically to malloc.
+ */
 void* S_SlabAlloc(S_Cache* cache) {
     if (cache->partial_list == NULL) { // we need to create a partial slab
         // check free list is empty, if so, use a slab from the free list first before creating a new one
@@ -155,9 +200,20 @@ void* S_SlabAlloc(S_Cache* cache) {
         return S_SlabAlloc(cache); // retry with next slab
     }
 
-    return (char*)partial_slab->data + (global_index * cache->object_size);
+    void* ptr = (char*)partial_slab->data + (global_index * cache->object_size);
+
+    // we may have now filled the last slot, so we recheck for fullness
+    if (S_CheckSlabFull(partial_slab)) {
+        cache->partial_list = partial_slab->next;
+        S_AddSlabToCacheFullList(cache, partial_slab);
+    }
+
+    return ptr;
 }
 
+/*
+ * Remove a slot's data and unoccupy it; functions equivalently to free.
+ */
 void S_SlabFree(S_Cache* cache, void* ptr) {
     if (!ptr) return; // called with null
     
@@ -198,27 +254,28 @@ void S_SlabFree(S_Cache* cache, void* ptr) {
     u32 global_index = offset / cache->object_size;
     u32 bitmask_number = global_index >> 6;
     u32 bit_number = global_index % 64;
-
     target_slab->bitmasks[bitmask_number] &= ~((u64)1 << bit_number);
 
+    // remove the slab from the corresponding list
     if (located_in_full) {
-        // our slab was in the full list, but now since it has slots empty, we can move it to the partial list
         if (prev_slab) prev_slab->next = target_slab->next;
         else cache->full_list = target_slab->next;
-
-        S_AddSlabToCachePartialList(cache, target_slab);
+    } else {
+        if (prev_slab) prev_slab->next = target_slab->next;
+        else cache->partial_list = target_slab->next;
     }
-    else {
-        if (S_CheckSlabEmpty(cache, target_slab)) {
-            // our slab was in the partial list, but now is completely empty, so move it to the free list
-            if (prev_slab) prev_slab->next = target_slab->next;
-            else cache->partial_list = target_slab->next;
 
-            S_AddSlabToCacheFreeList(cache, target_slab);
-        }
+    // if the slab is now empty, we move it to free list, otherwise we move it to partial list 
+    if (S_CheckSlabEmpty(cache, target_slab)) {
+        S_AddSlabToCacheFreeList(cache, target_slab);
+    } else {
+        S_AddSlabToCachePartialList(cache, target_slab);
     }
 }
 
+/*
+ * Iterates through a linked list of slabs and frees each.
+ */
 void S_FreeSlabList(S_Slab* list_head) {
     S_Slab* cur = list_head;
     while (cur) {

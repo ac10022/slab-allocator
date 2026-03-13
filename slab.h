@@ -14,6 +14,7 @@ typedef struct {
     S_Slab* free_list;
 } S_Cache;
 
+void S_CacheSimpleInit(S_Cache* cache, unsigned int size);
 void S_CacheInit(S_Cache* cache, unsigned int size, unsigned int order);
 void* S_SlabAlloc(S_Cache* cache);
 void S_SlabFree(S_Cache* cache, void* ptr);
